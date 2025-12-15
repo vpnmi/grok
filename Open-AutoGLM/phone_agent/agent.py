@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 from phone_agent.actions import ActionHandler
 from phone_agent.actions.handler import do, finish, parse_action
-from phone_agent.adb import get_current_app, get_screenshot
+from phone_agent.adb import get_current_app, get_screenshot, get_ui_hierarchy_compact
 from phone_agent.config import get_messages, get_system_prompt
 from phone_agent.model import ModelClient, ModelConfig
 from phone_agent.model.client import MessageBuilder
@@ -34,6 +34,10 @@ class AgentConfig:
     auto_retry_on_no_change: bool = True
     auto_retry_max: int = 1
     auto_retry_wait_s: float = 1.0
+    include_ui_hierarchy: bool = True
+    ui_hierarchy_max_nodes: int = 180
+    # If the agent sees "no change" repeatedly, do a generic recovery
+    stuck_no_change_threshold: int = 3
 
     def __post_init__(self):
         if self.system_prompt is None:
@@ -92,6 +96,7 @@ class PhoneAgent:
 
         self._context: list[dict[str, Any]] = []
         self._step_count = 0
+        self._no_change_streak = 0
 
     def _append_trace_event(self, event: dict[str, Any]) -> None:
         """Append a single trace event as JSONL (best-effort)."""
@@ -194,6 +199,7 @@ class PhoneAgent:
         """Reset the agent state for a new task."""
         self._context = []
         self._step_count = 0
+        self._no_change_streak = 0
 
     def _execute_step(
         self, user_prompt: str | None = None, is_first: bool = False
@@ -205,6 +211,11 @@ class PhoneAgent:
         # Capture current screen state
         screenshot = get_screenshot(self.agent_config.device_id)
         current_app = get_current_app(self.agent_config.device_id)
+        ui_nodes: list[dict[str, str]] = []
+        if self.agent_config.include_ui_hierarchy and not screenshot.is_sensitive:
+            ui_nodes = get_ui_hierarchy_compact(
+                self.agent_config.device_id, max_nodes=self.agent_config.ui_hierarchy_max_nodes
+            )
         screenshot_file = self._maybe_save_screenshot_for_trace(
             screenshot.base64_data, self._step_count
         )
@@ -246,7 +257,7 @@ class PhoneAgent:
                 MessageBuilder.create_system_message(self.agent_config.system_prompt)
             )
 
-            screen_info = MessageBuilder.build_screen_info(current_app)
+            screen_info = MessageBuilder.build_screen_info(current_app, ui=ui_nodes)
             text_content = f"{user_prompt}\n\n{screen_info}"
 
             self._context.append(
@@ -255,7 +266,7 @@ class PhoneAgent:
                 )
             )
         else:
-            screen_info = MessageBuilder.build_screen_info(current_app)
+            screen_info = MessageBuilder.build_screen_info(current_app, ui=ui_nodes)
             text_content = f"** Screen Info **\n\n{screen_info}"
 
             self._context.append(
@@ -364,12 +375,14 @@ class PhoneAgent:
                 after_fp = self._screen_fingerprint(after.base64_data, after_app)
 
                 if after_fp == before_fp:
+                    self._no_change_streak += 1
                     self._append_trace_event(
                         {
                             "event": "no_change_detected",
                             "step": self._step_count,
                             "ts": time.time(),
                             "action_name": action_name,
+                            "streak": self._no_change_streak,
                         }
                     )
                     # Wait then retry the same action once (best-effort)
@@ -409,6 +422,29 @@ class PhoneAgent:
                     # Prefer retry outcome if it improved, but do not force-finish here.
                     if retry_result.success:
                         result = retry_result
+                else:
+                    self._no_change_streak = 0
+
+        # Generic recovery if stuck: one Back to escape overlays / dead ends
+        if (
+            self.agent_config.stuck_no_change_threshold > 0
+            and self._no_change_streak >= self.agent_config.stuck_no_change_threshold
+        ):
+            self._append_trace_event(
+                {
+                    "event": "stuck_recovery_back",
+                    "step": self._step_count,
+                    "ts": time.time(),
+                    "streak": self._no_change_streak,
+                }
+            )
+            try:
+                self.action_handler.execute(
+                    do(action="Back"), screenshot.width, screenshot.height
+                )
+            except Exception:
+                pass
+            self._no_change_streak = 0
 
         # Trace: step outcome
         self._append_trace_event(

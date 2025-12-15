@@ -11,6 +11,7 @@ from phone_agent.adb.device import (
     back,
     double_tap,
     get_current_app,
+    get_ui_hierarchy_compact,
     home,
     launch_app,
     long_press,
@@ -35,6 +36,7 @@ __all__ = [
     "restore_keyboard",
     # Device control
     "get_current_app",
+    "get_ui_hierarchy_compact",
     "tap",
     "swipe",
     "back",

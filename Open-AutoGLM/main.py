@@ -390,6 +390,13 @@ Examples:
         help="Directory to save screenshots when trace is enabled (optional)",
     )
 
+    # Robustness (optional)
+    parser.add_argument(
+        "--no-ui-hierarchy",
+        action="store_true",
+        help="Disable UIAutomator hierarchy dump (may reduce robustness)",
+    )
+
     parser.add_argument(
         "task",
         nargs="?",
@@ -509,6 +516,7 @@ def main():
         trace_path=args.trace,
         trace_save_screenshots=not args.trace_no_screenshots,
         trace_screenshot_dir=args.trace_screenshot_dir,
+        include_ui_hierarchy=not args.no_ui_hierarchy,
     )
 
     # Create agent

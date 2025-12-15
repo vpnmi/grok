@@ -3,6 +3,8 @@
 import os
 import subprocess
 import time
+import xml.etree.ElementTree as ET
+import tempfile
 from typing import List, Optional, Tuple
 
 from phone_agent.config.apps import APP_PACKAGES
@@ -55,6 +57,71 @@ def _run_adb(
         time.sleep(sleep_s * (i + 1))
     return last or subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="unknown")
 
+
+def get_ui_hierarchy_compact(
+    device_id: str | None = None,
+    *,
+    max_nodes: int = 180,
+    timeout: int = 10,
+) -> list[dict[str, str]]:
+    """
+    Dump UIAutomator hierarchy and return a compact list of nodes.
+
+    This is useful for improving robustness: the model can use visible text/content-desc
+    and bounds instead of relying purely on image-based coordinate guessing.
+    """
+    adb_prefix = _get_adb_prefix(device_id)
+
+    # Dump UI hierarchy on device
+    remote_path = "/sdcard/uidump.xml"
+    dump = _run_adb(adb_prefix + ["shell", "uiautomator", "dump", remote_path], retries=1, timeout=timeout)
+    if dump.returncode != 0:
+        return []
+
+    # Pull to a temp file
+    local_path = os.path.join(tempfile.gettempdir(), f"uidump_{int(time.time()*1000)}.xml")
+    pull = _run_adb(adb_prefix + ["pull", remote_path, local_path], retries=1, timeout=timeout)
+    if pull.returncode != 0 or not os.path.exists(local_path):
+        return []
+
+    try:
+        tree = ET.parse(local_path)
+        root = tree.getroot()
+        out: list[dict[str, str]] = []
+
+        for node in root.iter():
+            if node.tag != "node":
+                continue
+            text = (node.attrib.get("text") or "").strip()
+            desc = (node.attrib.get("content-desc") or "").strip()
+            rid = (node.attrib.get("resource-id") or "").strip()
+            clazz = (node.attrib.get("class") or "").strip()
+            bounds = (node.attrib.get("bounds") or "").strip()
+
+            # Keep nodes that carry semantic signal
+            if not (text or desc or rid):
+                continue
+
+            out.append(
+                {
+                    "text": text,
+                    "desc": desc,
+                    "id": rid,
+                    "class": clazz,
+                    "bounds": bounds,
+                }
+            )
+            if len(out) >= max_nodes:
+                break
+
+        return out
+    except Exception:
+        return []
+    finally:
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
 
 def get_current_app(device_id: str | None = None) -> str:
     """
