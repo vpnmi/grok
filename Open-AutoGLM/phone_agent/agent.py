@@ -29,6 +29,11 @@ class AgentConfig:
     trace_path: str | None = None  # JSONL file path
     trace_save_screenshots: bool = True
     trace_screenshot_dir: str | None = None  # If None, derive from trace_path
+    # Robustness knobs
+    auto_takeover_on_sensitive_screen: bool = True
+    auto_retry_on_no_change: bool = True
+    auto_retry_max: int = 1
+    auto_retry_wait_s: float = 1.0
 
     def __post_init__(self):
         if self.system_prompt is None:
@@ -128,6 +133,16 @@ class PhoneAgent:
                 traceback.print_exc()
             return None
 
+    @staticmethod
+    def _screen_fingerprint(screenshot_b64: str, current_app: str) -> str:
+        """
+        Cheap fingerprint to detect if screen likely changed.
+
+        We avoid heavy image diff; base64 prefix is usually enough to catch changes.
+        """
+        prefix = screenshot_b64[:512] if screenshot_b64 else ""
+        return f"{current_app}|{prefix}"
+
     def run(self, task: str) -> str:
         """
         Run the agent to complete a task.
@@ -193,6 +208,37 @@ class PhoneAgent:
         screenshot_file = self._maybe_save_screenshot_for_trace(
             screenshot.base64_data, self._step_count
         )
+
+        # If we're on a sensitive/black screen, ask for takeover rather than looping blindly.
+        if screenshot.is_sensitive and self.agent_config.auto_takeover_on_sensitive_screen:
+            takeover_action = do(
+                action="Take_over",
+                message="检测到敏感页面/截图黑屏（如支付/密码/银行页），请手动完成后继续。",
+            )
+            self._append_trace_event(
+                {
+                    "event": "sensitive_screen_takeover",
+                    "step": self._step_count,
+                    "ts": time.time(),
+                    "current_app": current_app,
+                    "screenshot": {
+                        "path": screenshot_file,
+                        "width": screenshot.width,
+                        "height": screenshot.height,
+                        "is_sensitive": True,
+                    },
+                }
+            )
+            result = self.action_handler.execute(
+                takeover_action, screenshot.width, screenshot.height
+            )
+            return StepResult(
+                success=result.success,
+                finished=False,
+                action=takeover_action,
+                thinking="",
+                message=result.message,
+            )
 
         # Build messages
         if is_first:
@@ -292,6 +338,77 @@ class PhoneAgent:
             result = self.action_handler.execute(
                 finish(message=str(e)), screenshot.width, screenshot.height
             )
+
+        # Robustness: if a UI action likely didn't take effect, auto-wait and retry once.
+        if (
+            self.agent_config.auto_retry_on_no_change
+            and action.get("_metadata") == "do"
+            and self.agent_config.auto_retry_max > 0
+        ):
+            action_name = action.get("action")
+            should_verify = action_name in {
+                "Tap",
+                "Swipe",
+                "Launch",
+                "Back",
+                "Home",
+                "Double Tap",
+                "Long Press",
+            }
+            if should_verify and result.success:
+                before_fp = self._screen_fingerprint(screenshot.base64_data, current_app)
+                # Give the UI a short chance to update before checking
+                time.sleep(0.2)
+                after = get_screenshot(self.agent_config.device_id)
+                after_app = get_current_app(self.agent_config.device_id)
+                after_fp = self._screen_fingerprint(after.base64_data, after_app)
+
+                if after_fp == before_fp:
+                    self._append_trace_event(
+                        {
+                            "event": "no_change_detected",
+                            "step": self._step_count,
+                            "ts": time.time(),
+                            "action_name": action_name,
+                        }
+                    )
+                    # Wait then retry the same action once (best-effort)
+                    time.sleep(self.agent_config.auto_retry_wait_s)
+                    retry_action = action
+                    # For Tap-like actions, slightly adjust tap point to avoid dead zones
+                    if action_name in {"Tap", "Double Tap", "Long Press"} and isinstance(
+                        action.get("element"), list
+                    ):
+                        try:
+                            x, y = action["element"][:2]
+                            retry_action = dict(action)
+                            retry_action["element"] = [
+                                max(0, min(999, int(x) + 10)),
+                                max(0, min(999, int(y) + 10)),
+                            ]
+                        except Exception:
+                            retry_action = action
+
+                    retry_result = self.action_handler.execute(
+                        retry_action, screenshot.width, screenshot.height
+                    )
+                    self._append_trace_event(
+                        {
+                            "event": "auto_retry_executed",
+                            "step": self._step_count,
+                            "ts": time.time(),
+                            "action_name": action_name,
+                            "retry_action": retry_action,
+                            "retry_result": {
+                                "success": retry_result.success,
+                                "should_finish": retry_result.should_finish,
+                                "message": retry_result.message,
+                            },
+                        }
+                    )
+                    # Prefer retry outcome if it improved, but do not force-finish here.
+                    if retry_result.success:
+                        result = retry_result
 
         # Trace: step outcome
         self._append_trace_event(

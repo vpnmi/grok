@@ -2,7 +2,22 @@
 
 import base64
 import subprocess
+import time
 from typing import Optional
+
+
+def _run_adb(cmd: list[str], *, retries: int = 2, timeout: int = 10) -> subprocess.CompletedProcess:
+    """Run adb command with light retries for stability."""
+    last: subprocess.CompletedProcess | None = None
+    for i in range(max(1, retries + 1)):
+        try:
+            last = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if last.returncode == 0:
+                return last
+        except subprocess.TimeoutExpired as e:
+            last = subprocess.CompletedProcess(cmd, returncode=124, stdout="", stderr=str(e))
+        time.sleep(0.15 * (i + 1))
+    return last or subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="unknown")
 
 
 def type_text(text: str, device_id: str | None = None) -> None:
@@ -20,7 +35,7 @@ def type_text(text: str, device_id: str | None = None) -> None:
     adb_prefix = _get_adb_prefix(device_id)
     encoded_text = base64.b64encode(text.encode("utf-8")).decode("utf-8")
 
-    subprocess.run(
+    _run_adb(
         adb_prefix
         + [
             "shell",
@@ -32,8 +47,8 @@ def type_text(text: str, device_id: str | None = None) -> None:
             "msg",
             encoded_text,
         ],
-        capture_output=True,
-        text=True,
+        retries=2,
+        timeout=10,
     )
 
 
@@ -46,10 +61,10 @@ def clear_text(device_id: str | None = None) -> None:
     """
     adb_prefix = _get_adb_prefix(device_id)
 
-    subprocess.run(
+    _run_adb(
         adb_prefix + ["shell", "am", "broadcast", "-a", "ADB_CLEAR_TEXT"],
-        capture_output=True,
-        text=True,
+        retries=2,
+        timeout=10,
     )
 
 
@@ -66,19 +81,19 @@ def detect_and_set_adb_keyboard(device_id: str | None = None) -> str:
     adb_prefix = _get_adb_prefix(device_id)
 
     # Get current IME
-    result = subprocess.run(
+    result = _run_adb(
         adb_prefix + ["shell", "settings", "get", "secure", "default_input_method"],
-        capture_output=True,
-        text=True,
+        retries=1,
+        timeout=5,
     )
     current_ime = (result.stdout + result.stderr).strip()
 
     # Switch to ADB Keyboard if not already set
     if "com.android.adbkeyboard/.AdbIME" not in current_ime:
-        subprocess.run(
+        _run_adb(
             adb_prefix + ["shell", "ime", "set", "com.android.adbkeyboard/.AdbIME"],
-            capture_output=True,
-            text=True,
+            retries=2,
+            timeout=10,
         )
 
     # Warm up the keyboard
@@ -97,9 +112,7 @@ def restore_keyboard(ime: str, device_id: str | None = None) -> None:
     """
     adb_prefix = _get_adb_prefix(device_id)
 
-    subprocess.run(
-        adb_prefix + ["shell", "ime", "set", ime], capture_output=True, text=True
-    )
+    _run_adb(adb_prefix + ["shell", "ime", "set", ime], retries=2, timeout=10)
 
 
 def _get_adb_prefix(device_id: str | None) -> list:

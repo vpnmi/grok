@@ -120,9 +120,12 @@ class ActionHandler:
     def _convert_relative_to_absolute(
         self, element: list[int], screen_width: int, screen_height: int
     ) -> tuple[int, int]:
-        """Convert relative coordinates (0-1000) to absolute pixels."""
+        """Convert relative coordinates (0-1000) to absolute pixels (clamped)."""
         x = int(element[0] / 1000 * screen_width)
         y = int(element[1] / 1000 * screen_height)
+        # Clamp to screen bounds to avoid adb failures on edge cases (e.g. 1000 -> width)
+        x = max(0, min(x, max(0, screen_width - 1)))
+        y = max(0, min(y, max(0, screen_height - 1)))
         return x, y
 
     def _handle_launch(self, action: dict, width: int, height: int) -> ActionResult:
@@ -302,13 +305,33 @@ def parse_action(response: str) -> dict[str, Any]:
                 raise ValueError(f"Failed to parse do() action: {e}")
 
         elif response.startswith("finish"):
-            action = {
-                "_metadata": "finish",
-                "message": response.replace("finish(message=", "")[1:-2],
-            }
+            # Parse finish(...) safely via AST (supports quotes / escaping)
+            try:
+                tree = ast.parse(response, mode="eval")
+                if not isinstance(tree.body, ast.Call):
+                    raise ValueError("Expected a function call")
+                call = tree.body
+                action: dict[str, Any] = {"_metadata": "finish"}
+
+                # Keyword form: finish(message="xxx")
+                for keyword in call.keywords:
+                    key = keyword.arg
+                    value = ast.literal_eval(keyword.value)
+                    action[key] = value
+
+                # Positional form fallback: finish("xxx")
+                if "message" not in action and getattr(call, "args", None):
+                    if len(call.args) == 1:
+                        action["message"] = ast.literal_eval(call.args[0])
+                return action
+            except Exception as e:
+                # Last resort: regex extraction (avoid crashing the agent)
+                m = re.search(r'finish\s*\(\s*message\s*=\s*([\'"])(.*)\1\s*\)\s*$', response)
+                if m:
+                    return {"_metadata": "finish", "message": m.group(2)}
+                raise ValueError(f"Failed to parse finish() action: {e}")
         else:
             raise ValueError(f"Failed to parse action: {response}")
-        return action
     except Exception as e:
         raise ValueError(f"Failed to parse action: {e}")
 

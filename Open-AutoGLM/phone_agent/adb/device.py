@@ -8,6 +8,54 @@ from typing import List, Optional, Tuple
 from phone_agent.config.apps import APP_PACKAGES
 
 
+def _run_adb(
+    cmd: list[str],
+    *,
+    retries: int = 2,
+    timeout: int = 10,
+    sleep_s: float = 0.2,
+) -> subprocess.CompletedProcess:
+    """
+    Run an adb command with small retries for stability.
+
+    This keeps existing APIs backward-compatible (functions still return None/bool)
+    while reducing flakiness from transient adb issues.
+    """
+    last: subprocess.CompletedProcess | None = None
+    for i in range(max(1, retries + 1)):
+        try:
+            last = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            if last.returncode == 0:
+                return last
+            # Retry on typical transient errors
+            out = (last.stdout or "") + (last.stderr or "")
+            transient = any(
+                s in out.lower()
+                for s in [
+                    "device offline",
+                    "offline",
+                    "timeout",
+                    "timed out",
+                    "closed",
+                    "not found",
+                    "no devices",
+                    "unauthorized",
+                ]
+            )
+            if not transient:
+                return last
+        except subprocess.TimeoutExpired as e:
+            # Treat as retryable
+            last = subprocess.CompletedProcess(cmd, returncode=124, stdout="", stderr=str(e))
+        time.sleep(sleep_s * (i + 1))
+    return last or subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="unknown")
+
+
 def get_current_app(device_id: str | None = None) -> str:
     """
     Get the currently focused app name.
@@ -20,9 +68,7 @@ def get_current_app(device_id: str | None = None) -> str:
     """
     adb_prefix = _get_adb_prefix(device_id)
 
-    result = subprocess.run(
-        adb_prefix + ["shell", "dumpsys", "window"], capture_output=True, text=True
-    )
+    result = _run_adb(adb_prefix + ["shell", "dumpsys", "window"], retries=1, timeout=5)
     output = result.stdout
 
     # Parse window focus info
@@ -47,8 +93,10 @@ def tap(x: int, y: int, device_id: str | None = None, delay: float = 1.0) -> Non
     """
     adb_prefix = _get_adb_prefix(device_id)
 
-    subprocess.run(
-        adb_prefix + ["shell", "input", "tap", str(x), str(y)], capture_output=True
+    _run_adb(
+        adb_prefix + ["shell", "input", "tap", str(x), str(y)],
+        retries=2,
+        timeout=10,
     )
     time.sleep(delay)
 
@@ -67,13 +115,9 @@ def double_tap(
     """
     adb_prefix = _get_adb_prefix(device_id)
 
-    subprocess.run(
-        adb_prefix + ["shell", "input", "tap", str(x), str(y)], capture_output=True
-    )
+    _run_adb(adb_prefix + ["shell", "input", "tap", str(x), str(y)], retries=2, timeout=10)
     time.sleep(0.1)
-    subprocess.run(
-        adb_prefix + ["shell", "input", "tap", str(x), str(y)], capture_output=True
-    )
+    _run_adb(adb_prefix + ["shell", "input", "tap", str(x), str(y)], retries=2, timeout=10)
     time.sleep(delay)
 
 
@@ -96,10 +140,11 @@ def long_press(
     """
     adb_prefix = _get_adb_prefix(device_id)
 
-    subprocess.run(
+    _run_adb(
         adb_prefix
         + ["shell", "input", "swipe", str(x), str(y), str(x), str(y), str(duration_ms)],
-        capture_output=True,
+        retries=2,
+        timeout=10,
     )
     time.sleep(delay)
 
@@ -133,7 +178,7 @@ def swipe(
         duration_ms = int(dist_sq / 1000)
         duration_ms = max(1000, min(duration_ms, 2000))  # Clamp between 1000-2000ms
 
-    subprocess.run(
+    _run_adb(
         adb_prefix
         + [
             "shell",
@@ -145,7 +190,8 @@ def swipe(
             str(end_y),
             str(duration_ms),
         ],
-        capture_output=True,
+        retries=2,
+        timeout=10,
     )
     time.sleep(delay)
 
@@ -160,9 +206,7 @@ def back(device_id: str | None = None, delay: float = 1.0) -> None:
     """
     adb_prefix = _get_adb_prefix(device_id)
 
-    subprocess.run(
-        adb_prefix + ["shell", "input", "keyevent", "4"], capture_output=True
-    )
+    _run_adb(adb_prefix + ["shell", "input", "keyevent", "4"], retries=2, timeout=10)
     time.sleep(delay)
 
 
@@ -176,8 +220,8 @@ def home(device_id: str | None = None, delay: float = 1.0) -> None:
     """
     adb_prefix = _get_adb_prefix(device_id)
 
-    subprocess.run(
-        adb_prefix + ["shell", "input", "keyevent", "KEYCODE_HOME"], capture_output=True
+    _run_adb(
+        adb_prefix + ["shell", "input", "keyevent", "KEYCODE_HOME"], retries=2, timeout=10
     )
     time.sleep(delay)
 
@@ -200,7 +244,7 @@ def launch_app(app_name: str, device_id: str | None = None, delay: float = 1.0) 
     adb_prefix = _get_adb_prefix(device_id)
     package = APP_PACKAGES[app_name]
 
-    subprocess.run(
+    _run_adb(
         adb_prefix
         + [
             "shell",
@@ -211,7 +255,8 @@ def launch_app(app_name: str, device_id: str | None = None, delay: float = 1.0) 
             "android.intent.category.LAUNCHER",
             "1",
         ],
-        capture_output=True,
+        retries=2,
+        timeout=15,
     )
     time.sleep(delay)
     return True
