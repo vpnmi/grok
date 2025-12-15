@@ -38,6 +38,8 @@ class AgentConfig:
     ui_hierarchy_max_nodes: int = 180
     # If the agent sees "no change" repeatedly, do a generic recovery
     stuck_no_change_threshold: int = 3
+    # Captcha / verification handling
+    auto_takeover_on_captcha: bool = True
 
     def __post_init__(self):
         if self.system_prompt is None:
@@ -148,6 +150,57 @@ class PhoneAgent:
         prefix = screenshot_b64[:512] if screenshot_b64 else ""
         return f"{current_app}|{prefix}"
 
+    @staticmethod
+    def _detect_captcha(ui_nodes: list[dict[str, str]]) -> tuple[bool, str]:
+        """
+        Heuristic captcha / security verification detection based on UI hierarchy.
+
+        We DO NOT attempt to bypass verification; we only detect and request takeover.
+        """
+        if not ui_nodes:
+            return False, ""
+
+        keywords = [
+            "验证码",
+            "校验码",
+            "安全验证",
+            "安全校验",
+            "滑动验证",
+            "请完成验证",
+            "请先验证",
+            "人机验证",
+            "图形验证",
+            "短信验证码",
+            "发送验证码",
+            "获取验证码",
+            "请拖动滑块",
+            "拖动滑块",
+            "验证通过",
+            "captcha",
+            "verify",
+            "verification",
+            "recaptcha",
+        ]
+
+        def node_text(n: dict[str, str]) -> str:
+            return " ".join(
+                [
+                    (n.get("text") or ""),
+                    (n.get("desc") or ""),
+                    (n.get("id") or ""),
+                    (n.get("class") or ""),
+                ]
+            ).lower()
+
+        for n in ui_nodes:
+            t = node_text(n)
+            for kw in keywords:
+                if kw.lower() in t:
+                    evidence = (n.get("text") or n.get("desc") or n.get("id") or "").strip()
+                    return True, f"detected keyword '{kw}' in UI node: {evidence}"
+
+        return False, ""
+
     def run(self, task: str) -> str:
         """
         Run the agent to complete a task.
@@ -219,6 +272,40 @@ class PhoneAgent:
         screenshot_file = self._maybe_save_screenshot_for_trace(
             screenshot.base64_data, self._step_count
         )
+
+        # Captcha / verification page: stop and request user takeover
+        if self.agent_config.auto_takeover_on_captcha:
+            is_captcha, reason = self._detect_captcha(ui_nodes)
+            if is_captcha:
+                takeover_action = do(
+                    action="Take_over",
+                    message="检测到验证码/安全验证页面，请你手动完成验证后继续。",
+                )
+                self._append_trace_event(
+                    {
+                        "event": "captcha_takeover",
+                        "step": self._step_count,
+                        "ts": time.time(),
+                        "current_app": current_app,
+                        "reason": reason,
+                        "screenshot": {
+                            "path": screenshot_file,
+                            "width": screenshot.width,
+                            "height": screenshot.height,
+                            "is_sensitive": screenshot.is_sensitive,
+                        },
+                    }
+                )
+                result = self.action_handler.execute(
+                    takeover_action, screenshot.width, screenshot.height
+                )
+                return StepResult(
+                    success=result.success,
+                    finished=False,
+                    action=takeover_action,
+                    thinking="",
+                    message=result.message,
+                )
 
         # If we're on a sensitive/black screen, ask for takeover rather than looping blindly.
         if screenshot.is_sensitive and self.agent_config.auto_takeover_on_sensitive_screen:

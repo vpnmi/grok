@@ -396,6 +396,11 @@ Examples:
         action="store_true",
         help="Disable UIAutomator hierarchy dump (may reduce robustness)",
     )
+    parser.add_argument(
+        "--no-captcha-takeover",
+        action="store_true",
+        help="Do not auto pause on captcha/verification pages",
+    )
 
     parser.add_argument(
         "task",
@@ -517,6 +522,7 @@ def main():
         trace_save_screenshots=not args.trace_no_screenshots,
         trace_screenshot_dir=args.trace_screenshot_dir,
         include_ui_hierarchy=not args.no_ui_hierarchy,
+        auto_takeover_on_captcha=not args.no_captcha_takeover,
     )
 
     # Create agent
